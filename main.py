@@ -688,7 +688,7 @@ async def custom_404_handler(request: Request, exc):
 
 
 # 静态资源（部署开启）
-app.mount("/", StaticFiles(directory="dist", html=True), name="static")
+app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
 
 if __name__ == "__main__":
