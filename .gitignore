@@ -1,0 +1,30 @@
+# Python 虚拟环境
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+env/
+venv/
+
+# 数据库文件
+*.db
+*.sqlite
+
+# IDE 配置文件
+.idea/
+.vscode/
+*.iml
+*.swp
+.DS_Store
+
+# 前端相关
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+frontend/package-lock.json
+# 如果你想锁定依赖版本，package-lock.json可以保留，删掉上面这行
+
+# 系统缓存文件
+Thumbs.db
