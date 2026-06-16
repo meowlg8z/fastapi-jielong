@@ -5,10 +5,6 @@ import path from 'path'
 export default defineConfig({
   plugins: [vue()],
   // 打包输出到 项目根目录/dist
-  build: {
-    outDir: path.resolve(__dirname, '../dist'),
-    emptyOutDir: true
-  },
   server: {
     // 代理配置：将 /api 开头的请求转发到后端
     proxy: {
