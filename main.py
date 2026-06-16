@@ -6,11 +6,17 @@ from fastapi.middleware.cors import CORSMiddleware
 import sqlite3
 import os
 from datetime import datetime, timezone, timedelta
-# 定时任务 + 正则
 from apscheduler.schedulers.background import BackgroundScheduler
 import re
-# 生命周期
 from contextlib import asynccontextmanager
+
+# bcrypt：用于密码密文存储与验证（密码不可逆，不可查看明文）
+try:
+    import bcrypt
+    HAS_BCRYPT = True
+except ImportError:
+    HAS_BCRYPT = False
+    print("[警告] bcrypt 未安装，密码功能不可用，请执行: pip install bcrypt")
 
 try:
     import psycopg2
@@ -70,22 +76,72 @@ app.add_middleware(
 )
 
 
-# 数据库工具
+# 数据库工具：获取连接前先确保库表结构存在，避免运行期数据库文件丢失后无法自愈
 def get_db_conn():
     if USE_NEON:
         import psycopg2
         from psycopg2.extras import RealDictCursor
         conn = psycopg2.connect(NEON_DATABASE_URL, sslmode="require")
         cursor = conn.cursor(cursor_factory=RealDictCursor)
+        # PostgreSQL 侧表结构通常稳定存在，此处仅做一次轻量级建表保护（IF NOT EXISTS 开销很小）
+        _create_tables(cursor)
+        conn.commit()
         return conn, cursor
     else:
+        # sqlite：每次取连接都先确保数据库文件与表结构存在
+        # 原逻辑仅在应用启动时调用一次 init_db()，若运行期间 DB_FILE 被误删，
+        # 后续所有接口都会因「表不存在」持续报错；这里改为按需自愈，
+        # 任意接口（包括接龙列表刷新）触发取连接时都会自动重建数据库和表
         conn = sqlite3.connect(DB_FILE)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
+        _create_tables(cur)
+        conn.commit()
         return conn, cur
 
 
-# 建表
+# 建表语句集中维护：CREATE TABLE IF NOT EXISTS 本身具备幂等性，重复执行无副作用、开销极低
+def _create_tables(cursor):
+    """
+    传入数据库游标，依次创建 users / events / signups 三张核心表（若不存在）。
+    NEON(Postgres) 与 sqlite 的自增主键写法不同，需分支处理；其余字段定义保持一致。
+    """
+    id_type = "SERIAL PRIMARY KEY" if USE_NEON else "INTEGER PRIMARY KEY AUTOINCREMENT"
+
+    cursor.execute(f'''
+    CREATE TABLE IF NOT EXISTS users (
+        id {id_type},
+        nickname TEXT NOT NULL UNIQUE,
+        steam_id TEXT,
+        password_hash TEXT,
+        created_at TEXT
+    )
+    ''')
+    cursor.execute(f'''
+    CREATE TABLE IF NOT EXISTS events (
+        id {id_type},
+        title TEXT NOT NULL,
+        time_info TEXT,
+        description TEXT,
+        creator_id INTEGER,
+        created_at TEXT,
+        FOREIGN KEY (creator_id) REFERENCES users(id)
+    )
+    ''')
+    cursor.execute(f'''
+    CREATE TABLE IF NOT EXISTS signups (
+        id {id_type},
+        event_id INTEGER,
+        user_id INTEGER,
+        created_at TEXT,
+        UNIQUE(event_id, user_id),
+        FOREIGN KEY (event_id) REFERENCES events(id),
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    )
+    ''')
+
+
+# 应用启动时的建表入口：保留语义化函数名，内部委托给 _create_tables，避免重复代码
 def init_db():
     if USE_NEON:
         import psycopg2
@@ -95,79 +151,20 @@ def init_db():
         try:
             conn = psycopg2.connect(NEON_DATABASE_URL, sslmode="require")
             cursor = conn.cursor(cursor_factory=RealDictCursor)
-            cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                nickname TEXT NOT NULL,
-                steam_id TEXT NOT NULL,
-                created_at TEXT,
-                UNIQUE(steam_id)
-            )
-            ''')
-            cursor.execute('''
-            CREATE TABLE IF NOT EXISTS events (
-                id SERIAL PRIMARY KEY,
-                title TEXT NOT NULL,
-                time_info TEXT,
-                description TEXT,
-                creator_id INTEGER,
-                created_at TEXT,
-                FOREIGN KEY (creator_id) REFERENCES users(id)
-            )
-            ''')
-            cursor.execute('''
-            CREATE TABLE IF NOT EXISTS signups (
-                id SERIAL PRIMARY KEY,
-                event_id INTEGER,
-                user_id INTEGER,
-                created_at TEXT,
-                UNIQUE(event_id, user_id),
-                FOREIGN KEY (event_id) REFERENCES events(id),
-                FOREIGN KEY (user_id) REFERENCES users(id)
-            )
-            ''')
+            _create_tables(cursor)
             conn.commit()
         except Exception as e:
-            print(e)
-            pass
+            print(f"[初始化数据库异常] {e}")
         finally:
             if cursor: cursor.close()
             if conn: conn.close()
     else:
-        if not os.path.exists(DB_FILE):
-            conn = sqlite3.connect(DB_FILE)
-            cursor = conn.cursor()
-            cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                nickname TEXT NOT NULL,
-                steam_id TEXT NOT NULL,
-                created_at TEXT,
-                UNIQUE(steam_id)
-            )
-            ''')
-            cursor.execute('''
-            CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                time_info TEXT,
-                description TEXT,
-                creator_id INTEGER,
-                created_at TEXT
-            )
-            ''')
-            cursor.execute('''
-            CREATE TABLE IF NOT EXISTS signups (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_id INTEGER,
-                user_id INTEGER,
-                created_at TEXT,
-                UNIQUE(event_id, user_id),
-                FOREIGN KEY (event_id) REFERENCES events(id),
-                FOREIGN KEY (user_id) REFERENCES users(id)
-            )
-            ''')
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        try:
+            _create_tables(cursor)
             conn.commit()
+        finally:
             conn.close()
 
 
@@ -280,7 +277,8 @@ def auto_check_expire_events():
 # ====================== 数据模型 ======================
 class UserInfo(BaseModel):
     nickname: str
-    steam_id: str
+    steam_id: str = ""        # Steam ID 可选，默认空字符串
+    password: str | None = None  # 首次绑定时传密码；修改时传验证密码；无密码保护时为 None
 
 
 class EventCreate(BaseModel):
@@ -349,41 +347,163 @@ async def health():
     return {"status": "ok"}
 
 
-# 保存用户
-@app.post("/api/user")
-def save_user(user: UserInfo):
+# ====================== 用户接口 ======================
+
+def hash_password(pwd: str) -> str:
+    """使用 bcrypt 对密码加盐哈希，返回密文字符串（不可逆）"""
+    return bcrypt.hashpw(pwd.encode(), bcrypt.gensalt()).decode()
+
+
+def verify_password(pwd: str, hashed: str) -> bool:
+    """验证明文密码是否与密文匹配"""
+    try:
+        return bcrypt.checkpw(pwd.encode(), hashed.encode())
+    except Exception:
+        return False
+
+
+# 查询用户是否存在：支持三种查询方式（按需传参，优先级 user_id > steam_id > nickname）
+# - nickname：注册/登录前检测昵称是否已占用（原有用途）
+# - steam_id：绑定 Steam ID 前检测该 ID 是否已被其他账号占用
+# - user_id：前端本地缓存了 user_id 后，用于反查该账号是否仍然存在于数据库
+#   （例如被管理员删除后，本地缓存会变成「幽灵账号」，需要据此清理缓存）
+@app.get("/api/user/check")
+def check_nickname(
+    nickname: str | None = Query(None),
+    steam_id: str | None = Query(None),
+    user_id: int | None = Query(None)
+):
+    # 三个查询参数至少需要传一个，否则查询条件不明确
+    if not nickname and not steam_id and not user_id:
+        raise HTTPException(status_code=400, detail="nickname / steam_id / user_id 至少传一个")
+
     conn, cursor = get_db_conn()
     try:
+        # 按优先级拼接查询条件：user_id 最精确（主键），其次 steam_id，最后才是 nickname
+        if user_id:
+            sql = "SELECT id, nickname, steam_id, password_hash FROM users WHERE id = ?"
+            param = user_id
+        elif steam_id:
+            sql = "SELECT id, nickname, steam_id, password_hash FROM users WHERE steam_id = ?"
+            param = steam_id
+        else:
+            sql = "SELECT id, nickname, steam_id, password_hash FROM users WHERE nickname = ?"
+            param = nickname
+
         if USE_NEON:
-            cursor.execute("SELECT id FROM users WHERE steam_id = %s", (user.steam_id,))
-        else:
-            cursor.execute("SELECT id FROM users WHERE steam_id = ?", (user.steam_id,))
+            sql = sql.replace("?", "%s")
+        cursor.execute(sql, (param,))
         row = cursor.fetchone()
+        if not row:
+            return {"exists": False, "has_password": False}
+        row = dict(row)
+        return {
+            "exists": True,
+            "has_password": bool(row.get("password_hash")),
+            "user_id": row.get("id"),
+            "nickname": row.get("nickname"),
+            "steam_id": row.get("steam_id") or ""
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if USE_NEON: cursor.close()
+        conn.close()
+
+
+# 保存用户（新增/修改）
+@app.post("/api/user")
+def save_user(user: UserInfo):
+    if not HAS_BCRYPT:
+        raise HTTPException(status_code=500, detail="服务端缺少 bcrypt 依赖，请联系管理员")
+
+    nick = user.nickname.strip()
+    sid = user.steam_id.strip() if user.steam_id else ""
+    pwd_input = user.password.strip() if user.password else None
+
+    if not nick:
+        raise HTTPException(status_code=400, detail="昵称不能为空")
+
+    # Steam ID 非空时校验纯数字
+    if sid and not re.fullmatch(r"\d+", sid):
+        raise HTTPException(status_code=400, detail="Steam ID 必须为纯数字")
+
+    conn, cursor = get_db_conn()
+    try:
+        # 查询该账号是否已注册：同时匹配昵称或 Steam ID（任一命中即视为老用户）
+        # 原因：用户绑定 Steam ID 后昵称可自由修改，若仅按 nickname 查询，
+        # 改名后会因找不到旧昵称而被误判为「新用户」，导致重复创建账号、密码保护失效
+        sql_select = "SELECT id, password_hash, steam_id FROM users WHERE nickname = ? OR (steam_id != '' AND steam_id = ?)"
+        if USE_NEON:
+            sql_select = sql_select.replace("?", "%s")
+        cursor.execute(sql_select, (nick, sid))
+        row = cursor.fetchone()
+
         if row:
+            # ===== 已注册：验证密码后允许修改 =====
+            row = dict(row)
             user_id = row["id"]
+            existing_hash = row.get("password_hash")
+            existing_sid = row.get("steam_id") or ""
+
+            if existing_hash:
+                # 该昵称有密码保护：必须验证
+                if not pwd_input:
+                    return {"code": 403, "msg": "该昵称已设有密码，请输入密码后再修改"}
+                if not verify_password(pwd_input, existing_hash):
+                    return {"code": 403, "msg": "密码错误"}
+
+            # 关键校验：本次操作为「首次绑定 Steam ID」（之前未绑定，本次传入非空 sid），
+            # 必须同时设置密码，密码与绑定动作一一对应，杜绝出现无密码保护的绑定账号
+            is_first_bind_steam = bool(sid) and not existing_sid
+            if is_first_bind_steam and not pwd_input:
+                return {"code": 400, "msg": "绑定 Steam ID 需同时设置密码"}
+
+            # 首次绑定 Steam 时生成密码密文；非绑定场景密码字段保持原值不变
+            new_pwd_hash = hash_password(pwd_input) if is_first_bind_steam else existing_hash
+
+            sql_update = "UPDATE users SET nickname = ?, steam_id = ?, password_hash = ? WHERE id = ?"
             if USE_NEON:
-                cursor.execute("UPDATE users SET nickname = %s WHERE steam_id = %s", (user.nickname, user.steam_id))
-            else:
-                cursor.execute("UPDATE users SET nickname = ? WHERE steam_id = ?", (user.nickname, user.steam_id))
+                sql_update = sql_update.replace("?", "%s")
+            try:
+                cursor.execute(sql_update, (nick, sid, new_pwd_hash, user_id))
+            except Exception as e:
+                # nickname 字段带 UNIQUE 约束：并发场景下可能在前端查重通过后、提交更新前
+                # 被他人抢先占用同一昵称，此处兜底捕获唯一性冲突，给出明确业务提示而非裸 500 错误
+                is_unique_conflict = isinstance(e, sqlite3.IntegrityError) or \
+                    (psycopg2 is not None and isinstance(e, psycopg2.IntegrityError))
+                if is_unique_conflict:
+                    conn.rollback()
+                    return {"code": 400, "msg": "该昵称已被他人使用，请换一个"}
+                raise
             conn.commit()
-            return {"code": 200, "msg": "昵称已更新", "user_id": user_id}
+            return {"code": 200, "msg": "信息已更新", "user_id": user_id}
+
         else:
+            # ===== 新昵称：插入记录 =====
+            # 若本次注册同时绑定了 Steam ID，则强制要求设置密码（不要求二次确认密码）
+            if sid and not pwd_input:
+                return {"code": 400, "msg": "绑定 Steam ID 需同时设置密码"}
+
+            pwd_hash = hash_password(pwd_input) if pwd_input else None
             if USE_NEON:
                 cursor.execute(
-                    "INSERT INTO users (nickname, steam_id, created_at) VALUES (%s, %s, %s)",
-                    (user.nickname, user.steam_id, now_cn())
+                    "INSERT INTO users (nickname, steam_id, password_hash, created_at) VALUES (%s, %s, %s, %s)",
+                    (nick, sid, pwd_hash, now_cn())
                 )
                 cursor.execute("SELECT LASTVAL()")
                 new_id = cursor.fetchone()["lastval"]
             else:
                 cursor.execute(
-                    "INSERT INTO users (nickname, steam_id, created_at) VALUES (?, ?, ?)",
-                    (user.nickname, user.steam_id, now_cn())
+                    "INSERT INTO users (nickname, steam_id, password_hash, created_at) VALUES (?, ?, ?, ?)",
+                    (nick, sid, pwd_hash, now_cn())
                 )
                 cursor.execute("SELECT last_insert_rowid()")
                 new_id = cursor.fetchone()[0]
             conn.commit()
-            return {"code": 200, "msg": "信息保存成功", "user_id": new_id}
+            msg = "注册成功（已设置密码保护）" if pwd_hash else "注册成功"
+            return {"code": 200, "msg": msg, "user_id": new_id}
+
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -688,7 +808,7 @@ async def custom_404_handler(request: Request, exc):
 
 
 # 静态资源（部署开启）
-app.mount("/", StaticFiles(directory="static", html=True), name="static")
+app.mount("/", StaticFiles(directory="dist", html=True), name="static")
 
 
 if __name__ == "__main__":
